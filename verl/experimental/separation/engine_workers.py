@@ -68,7 +68,16 @@ class DetachActorWorker(ActorRolloutRefWorker):
 
         strategy = self.config.actor.strategy
 
-        if strategy in ["fsdp", "fsdp2"]:
+        if strategy == "fsdp":
+            # FSDP1 uses FlatParameter (not DTensor)
+            from verl.utils.fsdp_utils import (
+                fsdp1_sharded_load_from_cpu,
+                fsdp1_sharded_save_to_cpu,
+            )
+
+            self._strategy_handlers = (fsdp1_sharded_save_to_cpu, fsdp1_sharded_load_from_cpu)
+        elif strategy == "fsdp2":
+            # FSDP2 uses DTensor
             from verl.utils.fsdp_utils import (
                 fsdp2_sharded_load_from_cpu,
                 fsdp2_sharded_save_to_cpu,
@@ -111,7 +120,12 @@ class DetachActorWorker(ActorRolloutRefWorker):
         if n in self.cpu_saved_models:
             strategy = self.config.actor.strategy
 
-            if strategy in ["fsdp", "fsdp2"]:
+            if strategy == "fsdp":
+                # FSDP1: saved state is a dict[str, torch.Tensor]
+                cpu_sharded_state = self.cpu_saved_models[n]
+                self.restore_handler(self.actor.engine.module, cpu_sharded_state)
+            elif strategy == "fsdp2":
+                # FSDP2: saved state is a tuple (dict[str, tuple[Tensor, DTensorSpec]], DTensorSpec)
                 cpu_sharded_state, global_spec = self.cpu_saved_models[n]
                 self.restore_handler(self.actor.engine.module, cpu_sharded_state, global_spec)
             else:

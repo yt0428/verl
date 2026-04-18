@@ -159,6 +159,18 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         super().__init__(config, worker_group, rollout_resource_pool, teacher_model_manager, reward_loop_worker_handles)
         if self.distillation_enabled:
             raise NotImplementedError("Distillation is not implemented in FullyAsyncAgentLoopManager yet.")
+        # Initialize worker queue for idle worker selection
+        self._worker_queue: Optional[asyncio.Queue] = None
+        self._worker_queue_lock = asyncio.Lock()
+
+    async def _init_worker_queue(self) -> asyncio.Queue:
+        """Initialize worker queue lazily."""
+        async with self._worker_queue_lock:
+            if self._worker_queue is None:
+                self._worker_queue = asyncio.Queue()
+                for worker in self.agent_loop_workers:
+                    await self._worker_queue.put(worker)
+        return self._worker_queue
 
     @auto_await
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
@@ -169,15 +181,19 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Returns:
             DataProto: Output batch.
         """
-        worker = self._select_best_worker()
-        output_future = worker.generate_sequences.remote(prompts)
-        return await asyncio.wrap_future(output_future.future())
+        # Get an idle worker from queue (will wait if no workers available)
+        queue = await self._init_worker_queue()
+        worker = await queue.get()
+        try:
+            output_future = worker.generate_sequences.remote(prompts)
+            result = await asyncio.wrap_future(output_future.future())
+            return result
+        finally:
+            # Always return worker to queue after task completes or fails
+            await queue.put(worker)
+            queue.task_done()
 
-    def _select_best_worker(self):
-        """Select the best worker, simple round-robin load balancing"""
-        if not hasattr(self, "_worker_index"):
-            self._worker_index = 0
-
-        worker = self.agent_loop_workers[self._worker_index]
-        self._worker_index = (self._worker_index + 1) % len(self.agent_loop_workers)
-        return worker
+    async def _select_best_worker(self):
+        """Select an idle worker from queue (deprecated, use queue directly)."""
+        queue = await self._init_worker_queue()
+        return await queue.get()

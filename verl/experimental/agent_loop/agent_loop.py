@@ -1141,13 +1141,29 @@ class AgentLoopManager:
         """
         if self.stream_teacher_with_rollout:
             await self.teacher_model_manager.wake_up()
-        chunkes = prompts.chunk(len(self.agent_loop_workers))
-        outputs = await asyncio.gather(
-            *[
-                worker.generate_sequences.remote(chunk)
-                for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
-            ]
-        )
+
+        worker_queue = asyncio.Queue()
+        for worker in self.agent_loop_workers:
+            await worker_queue.put(worker)
+        single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
+        async def process_task(sample):
+            worker = await worker_queue.get()
+            try:
+                result = await worker.generate_sequences.remote(sample)
+            finally:
+                await worker_queue.put(worker)
+                worker_queue.task_done()
+            return result
+        task = [process_task(sample) for sample in single_samples]
+        outputs = await asyncio.gather(*task)
+
+        # chunkes = prompts.chunk(len(self.agent_loop_workers))
+        # outputs = await asyncio.gather(
+        #     *[
+        #         worker.generate_sequences.remote(chunk)
+        #         for worker, chunk in zip(self.agent_loop_workers, chunkes, strict=True)
+        #     ]
+        # )
         if self.stream_teacher_with_rollout:
             await self.teacher_model_manager.sleep()
         output = DataProto.concat(outputs)
