@@ -34,7 +34,6 @@ from torchdata.stateful_dataloader import StatefulDataLoader
 from tqdm import tqdm
 
 from verl import DataProto
-from verl.checkpoint_engine import CheckpointEngineManager
 from verl.experimental.dataset.sampler import AbstractCurriculumSampler
 from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.single_controller.ray import RayClassWithInitArgs, RayWorkerGroup, ResourcePoolManager
@@ -70,7 +69,7 @@ from verl.utils.rollout_skip import RolloutSkip
 from verl.utils.seqlen_balancing import calculate_workload, get_seqlen_balanced_partitions, log_seqlen_unbalance
 from verl.utils.torch_functional import masked_mean
 from verl.utils.tracking import ValidationGenerationsLogger
-from verl.workers.config import DistillationConfig, FSDPEngineConfig, McoreEngineConfig
+from verl.workers.config import DistillationConfig, EngineConfig
 from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
 
@@ -510,17 +509,6 @@ class RayPPOTrainer:
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
 
-    def _should_compute_teacher_colocate(self, batch: DataProto) -> bool:
-        return self.use_teacher_policy and not self.distillation_config.teacher_model.enable_resource_pool
-
-    def _compute_teacher_colocate(self, batch: DataProto) -> DataProto:
-        """Compute teacher logprobs after rollout when teacher and student are colocated."""
-        assert self.teacher_model_manager is not None, "TeacherModelManager is None"
-        teacher_batch = self.teacher_model_manager.compute_logprobs(batch)
-        if "teacher_multi_modal_data" in batch.non_tensor_batch:
-            batch.pop(non_tensor_batch_keys=["teacher_multi_modal_data"])
-        return teacher_batch
-
     def _validate(self, merged: bool = False):
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
@@ -735,16 +723,13 @@ class RayPPOTrainer:
                 from verl.workers.engine_workers import TrainingWorkerConfig
 
                 orig_critic_cfg = critic_cfg
-                if orig_critic_cfg.strategy == "fsdp":
-                    engine_config: FSDPEngineConfig = orig_critic_cfg.model.fsdp_config
-                else:
-                    engine_config: McoreEngineConfig = orig_critic_cfg.megatron
+                engine_config: EngineConfig = orig_critic_cfg.engine
                 engine_config.infer_max_token_len_per_gpu = critic_cfg.ppo_infer_max_token_len_per_gpu
                 engine_config.max_token_len_per_gpu = critic_cfg.ppo_max_token_len_per_gpu
 
                 critic_cfg = TrainingWorkerConfig(
                     model_type="value_model",
-                    model_config=orig_critic_cfg.model_config,
+                    model_config=orig_critic_cfg.model,
                     engine_config=engine_config,
                     optimizer_config=orig_critic_cfg.optim,
                     checkpoint_config=orig_critic_cfg.checkpoint,
@@ -881,7 +866,14 @@ class RayPPOTrainer:
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_model_manager=self.teacher_model_manager,
         )
+
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
+        # Support custom CheckpointEngineManager via config
+        checkpoint_manager_class_fqn = self.config.actor_rollout_ref.rollout.get("checkpoint_manager_class")
+        if checkpoint_manager_class_fqn:
+            CheckpointEngineManager = load_class_from_fqn(checkpoint_manager_class_fqn, "CheckpointEngineManager")
+        else:
+            from verl.checkpoint_engine import CheckpointEngineManager
         self.checkpoint_manager = CheckpointEngineManager(
             config=checkpoint_engine_config,
             trainer=self.actor_rollout_wg,
@@ -1221,7 +1213,9 @@ class RayPPOTrainer:
             batch_td = batch.to_tensordict()
             # step 2: convert from padding to no-padding
             batch_td = left_right_2_no_padding(batch_td)
-            calculate_entropy = self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
+                self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+            )
             distillation_use_topk = (
                 self.distillation_config.distillation_loss.loss_settings.use_topk
                 if is_distillation_enabled(self.config.get("distillation"))
@@ -1414,10 +1408,6 @@ class RayPPOTrainer:
                     # repeat to align with repeated responses in rollout
                     batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
                     batch = batch.union(gen_batch_output)
-                    if self._should_compute_teacher_colocate(batch):
-                        with marked_timer("teacher", timing_raw, color="cyan"):
-                            batch_teacher = self._compute_teacher_colocate(batch)
-                            batch = batch.union(batch_teacher)
 
                     if "response_mask" not in batch.batch.keys():
                         batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1562,7 +1552,10 @@ class RayPPOTrainer:
                         metrics.update(critic_output_metrics)
 
                     # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
+                    if self.config.trainer.critic_warmup > self.global_steps:
+                        # Still in critic warmup, only update weights to wake up rollout replicas.
+                        self.checkpoint_manager.update_weights(self.global_steps)
+                    else:
                         # update actor
                         with marked_timer("update_actor", timing_raw, color="red"):
                             actor_output = self._update_actor(batch)

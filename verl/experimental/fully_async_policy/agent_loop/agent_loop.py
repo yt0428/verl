@@ -33,6 +33,7 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import (
     rollout_trace_op,
 )
+from verl.utils.tokenizer import normalize_token_ids
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -65,6 +66,8 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
         Returns:
             TokenOutput: token output
         """
+        prompt_ids = normalize_token_ids(prompt_ids)
+
         limit_key = None
         if "max_tokens" in sampling_params:
             limit_key = "max_tokens"
@@ -93,11 +96,16 @@ class FullyAsyncLLMServerManager(AsyncLLMServerManager):
             final_output.token_ids.extend(output.token_ids)
             if output.log_probs is not None:
                 final_output.log_probs.extend(output.log_probs)
-            if output.routed_experts is not None:
+            # On partial rollout resume the model version may differ, so keep
+            # existing routing and only append routing for newly generated tokens.
+            if output.routed_experts is not None and len(output.token_ids) > 0:
                 if final_output.routed_experts is None:
                     final_output.routed_experts = output.routed_experts
                 else:
-                    final_output.routed_experts = torch.cat([final_output.routed_experts, output.routed_experts], dim=0)
+                    final_output.routed_experts = torch.cat(
+                        [final_output.routed_experts, output.routed_experts[-len(output.token_ids) :]],
+                        dim=0,
+                    )
             if output.num_preempted is not None:
                 final_output.num_preempted += output.num_preempted
             final_output.stop_reason = output.stop_reason

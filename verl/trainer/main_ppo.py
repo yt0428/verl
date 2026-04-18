@@ -163,10 +163,7 @@ class TaskRunner:
             actor_rollout_cls = AsyncActorRolloutRefWorker
             ray_worker_group_cls = RayWorkerGroup
 
-        elif (
-            config.actor_rollout_ref.actor.strategy == "veomni"
-            or config.actor_rollout_ref.actor.strategy == "torchtitan"
-        ):
+        elif config.actor_rollout_ref.actor.strategy in {"veomni", "torchtitan", "mindspeed"}:
             raise NotImplementedError(
                 f"{config.actor_rollout_ref.actor.strategy} does not support legacy worker implementation"
             )
@@ -202,7 +199,7 @@ class TaskRunner:
 
                 CriticWorker = TrainingWorker
                 print("Using new worker implementation")
-        elif config.critic.strategy == "veomni" or config.critic.strategy == "torchtitan":
+        elif config.critic.strategy in {"veomni", "torchtitan", "mindspeed"}:
             if use_legacy_worker_impl == "disable":
                 from verl.workers.engine_workers import TrainingWorker
 
@@ -243,19 +240,15 @@ class TaskRunner:
 
         distillation_config = config.get("distillation")
         if is_distillation_enabled(distillation_config):
-            if distillation_config.teacher_model.enable_resource_pool:
-                if distillation_config.teacher_model.n_gpus_per_node <= 0:
-                    raise ValueError("config.distillation.teacher_model.n_gpus_per_node must be greater than 0")
-                if distillation_config.teacher_model.nnodes <= 0:
-                    raise ValueError("config.distillation.teacher_model.nnodes must be greater than 0")
+            if distillation_config.teacher_model.n_gpus_per_node <= 0:
+                raise ValueError("config.distillation.teacher_model.n_gpus_per_node must be greater than 0")
+            if distillation_config.teacher_model.nnodes <= 0:
+                raise ValueError("config.distillation.teacher_model.nnodes must be greater than 0")
 
-                teacher_pool = [
-                    distillation_config.teacher_model.n_gpus_per_node
-                ] * distillation_config.teacher_model.nnodes
-                resource_pool_spec["teacher_pool"] = teacher_pool
-            else:
-                distillation_config.teacher_model.nnodes = config.trainer.nnodes
-                distillation_config.teacher_model.n_gpus_per_node = config.trainer.n_gpus_per_node
+            teacher_pool = [
+                distillation_config.teacher_model.n_gpus_per_node
+            ] * distillation_config.teacher_model.nnodes
+            resource_pool_spec["teacher_pool"] = teacher_pool
 
         from verl.trainer.ppo.ray_trainer import ResourcePoolManager
 
@@ -281,10 +274,7 @@ class TaskRunner:
         if is_distillation_enabled(config.get("distillation")):
             # we do not use teacher model workers, so we only register teacher model in resource pool
             # without registering a teacher model worker in role-worker mapping
-            if config.distillation.teacher_model.enable_resource_pool:
-                self.mapping[Role.TeacherModel] = "teacher_pool"
-            else:
-                self.mapping[Role.TeacherModel] = "global_pool"
+            self.mapping[Role.TeacherModel] = "teacher_pool"
 
     def add_ref_policy_worker(self, config, ref_policy_cls):
         """Add reference policy worker if KL loss or KL reward is used."""

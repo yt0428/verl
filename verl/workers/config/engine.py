@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import logging
+import os
 import warnings
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional
@@ -20,7 +22,7 @@ from verl.base_config import BaseConfig
 from verl.trainer.config import CheckpointConfig
 
 from ...utils.profiler import ProfilerConfig
-from .model import HFModelConfig
+from .model import DiffusionModelConfig, HFModelConfig
 from .optimizer import OptimizerConfig
 
 __all__ = [
@@ -33,7 +35,12 @@ __all__ = [
     "EngineConfig",
     "EngineRouterReplayConfig",
     "QATEngineConfig",
+    "MindSpeedEngineConfig",
 ]
+
+
+logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 
 # TODO: rename to RouterReplayConfig after removing the legacy implementation
@@ -156,6 +163,8 @@ class McoreEngineConfig(EngineConfig):
         virtual_pipeline_model_parallel_size (Optional[int]): Virtual pipeline model parallel size
             for interleaved scheduling.
         context_parallel_size (int): Context parallel size for long sequences.
+        dynamic_context_parallel (bool): Whether to enable hybrid context parallelism.
+        max_seqlen_per_dp_cp_rank (Optional[int]): Maximum sequence length per DPxCP rank.
         sequence_parallel (bool): Whether to enable sequence parallelism.
         use_distributed_optimizer (bool): Whether to use distributed optimizer.
         use_dist_checkpointing (bool): Whether to use distributed checkpointing.
@@ -178,6 +187,8 @@ class McoreEngineConfig(EngineConfig):
     pipeline_model_parallel_size: int = 1
     virtual_pipeline_model_parallel_size: Optional[int] = None
     context_parallel_size: int = 1
+    dynamic_context_parallel: bool = False
+    max_seqlen_per_dp_cp_rank: Optional[int] = None
     sequence_parallel: bool = True
     use_distributed_optimizer: bool = True
     use_dist_checkpointing: bool = False
@@ -306,6 +317,8 @@ class VeOmniEngineConfig(EngineConfig):
 
     """
 
+    _mutable_fields = EngineConfig._mutable_fields | {"attn_implementation"}
+
     wrap_policy: dict[str, Any] = field(default_factory=dict)
     offload_policy: bool = False
     reshard_after_forward: bool = True
@@ -336,6 +349,16 @@ class VeOmniEngineConfig(EngineConfig):
     def __post_init__(self):
         super().__post_init__()
         assert self.strategy in ["veomni"], f"strategy {self.strategy} not supported"
+
+        replacements = {
+            "flash_attention_2": "veomni_flash_attention_2_with_sp",
+            "flash_attention_3": "veomni_flash_attention_3_with_sp",
+            "flash_attention_4": "veomni_flash_attention_4_with_sp",
+        }
+        if self.attn_implementation in replacements:
+            new_impl = replacements[self.attn_implementation]
+            logger.info(f"Replacing attn_implementation from '{self.attn_implementation}' to '{new_impl}'")
+            self.attn_implementation = new_impl
 
 
 @dataclass
@@ -520,9 +543,33 @@ class AutomodelEngineConfig(EngineConfig):
 
 
 @dataclass
+class MindSpeedEngineConfig(McoreEngineConfig):
+    """Configuration for mindspeed parallelism.
+
+    The inheritance from BaseConfig provides omegaconf.DictConfig-like interface for a dataclass config.
+
+    Args:
+        llm_kwargs (str): mindspeed_llm engine kwargs.
+        mm_kwargs (str): mindspeed_mm engine kwargs.
+    """
+
+    strategy: str = "mindspeed_llm"
+    llm_kwargs: dict[str, Any] = field(default_factory=dict)
+    mm_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        """config validation logics go here"""
+        assert self.strategy in ["mindspeed_llm", "mindspeed_mm"], f"strategy {self.strategy} not supported"
+        assert self.dtype in ["bfloat16", "float16"], f"dtype {self.dtype} not supported"
+        if self.tensor_model_parallel_size == 1:
+            warnings.warn("set sequence parallel to false as TP size is 1", stacklevel=2)
+            self.sequence_parallel = False
+
+
+@dataclass
 class TrainingWorkerConfig(BaseConfig):
     model_type: str = None  # model type (language_model/value_model)
-    model_config: HFModelConfig = None
+    model_config: HFModelConfig | DiffusionModelConfig = None
     engine_config: EngineConfig = None
     optimizer_config: OptimizerConfig = None
     checkpoint_config: CheckpointConfig = None
