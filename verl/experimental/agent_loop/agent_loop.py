@@ -594,6 +594,7 @@ class AgentLoopWorker:
         for i in range(len(batch)):
             trace_this_sample = i in traced_indices
             kwargs = {k: v[i] for k, v in batch.non_tensor_batch.items()}
+            kwargs["global_steps"] = batch.meta_info.get("global_steps", 0)
             tasks.append(
                 asyncio.create_task(
                     self._run_agent_loop(sampling_params, trajectory_info[i], trace=trace_this_sample, **kwargs)
@@ -1173,9 +1174,6 @@ class AgentLoopManager:
         Returns:
             DataProto: Output batch.
         """
-        if self.stream_teacher_with_rollout:
-            await self.teacher_model_manager.wake_up()
-
         worker_queue = asyncio.Queue()
         for worker in self.agent_loop_workers:
             await worker_queue.put(worker)
