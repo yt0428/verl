@@ -177,7 +177,15 @@ class AsyncLLMServerManager:
 
 
 class AgentLoopMetrics(BaseModel):
-    """Agent loop performance metrics."""
+    """Agent loop performance metrics.
+
+    Standard fields track generic agent loop stages. Subclasses / concrete agent loops
+    may attach arbitrary extra timing fields (e.g. harbor env/agent/verifier phases),
+    which will be preserved by ``model_dump`` and aggregated by
+    :meth:`AgentLoopManager._performance_metrics` as ``agent_loop/{key}/{min,max,mean}``.
+    """
+
+    model_config = ConfigDict(extra="allow")
 
     generate_sequences: float = 0.0
     tool_calls: float = 0.0
@@ -1236,6 +1244,27 @@ class AgentLoopManager:
             attention_mask = output.batch["attention_mask"][slowest]
             timing["agent_loop/slowest/prompt_length"] = attention_mask[:prompt_length].sum().item()
             timing["agent_loop/slowest/response_length"] = attention_mask[prompt_length:].sum().item()
+
+        # Aggregate any extra timing fields attached by concrete agent loops
+        # (e.g. harbor env/agent/verifier phases). The resulting keys flow into
+        # ``timing_raw`` and surface as ``timing_s/agent_loop/{key}/{min,max,mean}``.
+        standard_keys = {"generate_sequences", "tool_calls", "compute_score", "num_preempted"}
+        extra_keys: set[str] = set()
+        for chunk in metrics:
+            for metric in chunk:
+                extra_keys.update(metric.keys())
+        extra_keys -= standard_keys
+        for key in sorted(extra_keys):
+            values = np.array(
+                [float(metric.get(key) or 0.0) for chunk in metrics for metric in chunk],
+                dtype=np.float64,
+            )
+            if values.size == 0:
+                continue
+            timing[f"agent_loop/{key}/min"] = values.min()
+            timing[f"agent_loop/{key}/max"] = values.max()
+            timing[f"agent_loop/{key}/mean"] = values.mean()
+            timing[f"agent_loop/slowest/{key}"] = values[slowest] if slowest < values.size else values.max()
 
         return timing
 
