@@ -207,7 +207,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 16
+            self.max_concurrent_samples = len(self.async_rollout_manager.server_handles) * 32
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
 
@@ -427,6 +427,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         for epoch, batch_dict in continuous_iterator:
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
+            full_batch.meta_info["global_steps"] = self.global_steps
 
             sample_id = f"sample_{epoch}_{self.global_steps}"
 
