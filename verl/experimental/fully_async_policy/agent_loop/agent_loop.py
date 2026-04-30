@@ -39,6 +39,28 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
+def _concat_outputs_same_metrics_layout(outputs: list[DataProto]) -> DataProto:
+    """Merge rollout shards like :meth:`DataProto.concat`, then restore ``meta_info["metrics"]``.
+
+    ``DataProto.concat`` turns per-sample metric dicts into columnar ``dict[str, list]``.
+    A single worker processing a whole batch leaves ``metrics`` as ``list[dict]``.
+    Fully-async splits work across workers and concatenates; without this step,
+    downstream code that assumes ``list[dict]`` (same as one-shot batch rollout)
+    would see a different shape.
+    """
+    merged = DataProto.concat(outputs)
+    m = merged.meta_info.get("metrics")
+    if not isinstance(m, dict) or not m:
+        return merged
+    keys = list(m.keys())
+    lengths = [len(m[k]) for k in keys]
+    if not lengths or min(lengths) != max(lengths):
+        return merged
+    n = lengths[0]
+    merged.meta_info["metrics"] = [{k: m[k][i] for k in keys} for i in range(n)]
+    return merged
+
+
 class FullyAsyncLLMServerManager(AsyncLLMServerManager):
     """FullyAsyncLLMServerManager supports resume generation on partial rollout, making rollout interruption
     invisible to the AgentLoop.
@@ -185,21 +207,27 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         """Split input batch and dispatch to agent loop workers.
 
         Args:
-            prompts (DataProto): Input batch. Single sample data
+            prompts (DataProto): Input batch.
         Returns:
             DataProto: Output batch.
         """
-        # Get an idle worker from queue (will wait if no workers available)
+        # Split to single-sample tasks and dispatch at worker granularity.
         queue = await self._init_worker_queue()
-        worker = await queue.get()
-        try:
-            output_future = worker.generate_sequences.remote(prompts)
-            result = await asyncio.wrap_future(output_future.future())
-            return result
-        finally:
-            # Always return worker to queue after task completes or fails
-            await queue.put(worker)
-            queue.task_done()
+        single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
+
+        async def process_task(sample: DataProto) -> DataProto:
+            worker = await queue.get()
+            try:
+                output_future = worker.generate_sequences.remote(sample)
+                result = await asyncio.wrap_future(output_future.future())
+                return result
+            finally:
+                # Always return worker to queue after task completes or fails.
+                await queue.put(worker)
+                queue.task_done()
+
+        outputs = await asyncio.gather(*[process_task(sample) for sample in single_samples])
+        return _concat_outputs_same_metrics_layout(outputs)
 
     async def _select_best_worker(self):
         """Select an idle worker from queue (deprecated, use queue directly)."""
