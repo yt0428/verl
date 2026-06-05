@@ -63,21 +63,112 @@ def prepare_single_generation_data(batch_dict, config) -> DataProto:
         )
 
     # Setting selected agent, that supports partial
-    if not config.actor_rollout_ref.rollout.multi_turn.enable:
-        full_batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(full_batch), dtype=object)
+    if config.actor_rollout_ref.rollout.multi_turn.enable:
+        full_batch.non_tensor_batch["agent_name"] = np.array(["tool_agent"] * len(full_batch), dtype=object)
+    else:
+        # full_batch.non_tensor_batch["agent_name"] = np.array(["single_turn_agent"] * len(full_batch), dtype=object)
+        pass
 
     # Add global step count to generated data
     full_batch = full_batch.repeat(repeat_times=config.actor_rollout_ref.rollout.n, interleave=True)
     return full_batch
 
 
+# Same semantic keys as ``AgentLoopManager._performance_metrics`` (agent_loop.py).
+_AGENT_LOOP_STANDARD_METRIC_KEYS = frozenset(
+    {"generate_sequences", "tool_calls", "compute_score", "num_preempted"}
+)
+
+
+def _aggregate_agent_loop_timing_meta(final_batch: DataProto) -> dict[str, float]:
+    """Mirror :meth:`AgentLoopManager._performance_metrics` for fully-async assembly.
+
+    Populates ``timing_s/agent_loop/...`` keys so ``FullyAsyncTrainer._collect_metrics_from_samples``
+    forwards them into ``self.metrics`` and loggers (same surface as synchronous rollout).
+    """
+    pt = np.asarray(final_batch.non_tensor_batch["processing_times"], dtype=np.float64)
+    tc = np.asarray(final_batch.non_tensor_batch["tool_calls_times"], dtype=np.float64)
+    n = pt.shape[0]
+    if "compute_score_times" in final_batch.non_tensor_batch:
+        t_cs = np.asarray(final_batch.non_tensor_batch["compute_score_times"], dtype=np.float64)
+    else:
+        t_cs = np.zeros(n, dtype=np.float64)
+    if "num_preempted_vals" in final_batch.non_tensor_batch:
+        npm = np.asarray(final_batch.non_tensor_batch["num_preempted_vals"], dtype=np.float64)
+    else:
+        npm = np.full(n, -1.0, dtype=np.float64)
+
+    slowest = int(np.argmax(pt + tc + t_cs)) if n > 0 else 0
+
+    out: dict[str, float] = {}
+    for name, arr in (
+        ("generate_sequences", pt),
+        ("tool_calls", tc),
+        ("compute_score", t_cs),
+        ("num_preempted", npm),
+    ):
+        if arr.size == 0:
+            continue
+        out[f"timing_s/agent_loop/{name}/min"] = float(arr.min())
+        out[f"timing_s/agent_loop/{name}/max"] = float(arr.max())
+        out[f"timing_s/agent_loop/{name}/mean"] = float(arr.mean())
+        if slowest < arr.size:
+            out[f"timing_s/agent_loop/slowest/{name}"] = float(arr[slowest])
+
+    extra_keys: set[str] = set()
+    for nk in final_batch.non_tensor_batch.keys():
+        if nk.startswith("_al_timing_"):
+            extra_keys.add(nk[len("_al_timing_") :])
+    for key in sorted(extra_keys):
+        vals = np.asarray(final_batch.non_tensor_batch[f"_al_timing_{key}"], dtype=np.float64)
+        if vals.size == 0:
+            continue
+        out[f"timing_s/agent_loop/{key}/min"] = float(vals.min())
+        out[f"timing_s/agent_loop/{key}/max"] = float(vals.max())
+        out[f"timing_s/agent_loop/{key}/mean"] = float(vals.mean())
+        if slowest < vals.size:
+            out[f"timing_s/agent_loop/slowest/{key}"] = float(vals[slowest])
+
+    if (
+        n > 0
+        and "attention_mask" in final_batch.batch
+        and "prompts" in final_batch.batch
+        and slowest < n
+    ):
+        prompt_length = int(final_batch.batch["prompts"].shape[1])
+        attention_mask = final_batch.batch["attention_mask"][slowest]
+        plen = min(prompt_length, int(attention_mask.shape[0]))
+        out["timing_s/agent_loop/slowest/prompt_length"] = float(attention_mask[:plen].sum().item())
+        out["timing_s/agent_loop/slowest/response_length"] = float(attention_mask[plen:].sum().item())
+
+    return out
+
+
 def addition_process(output: DataProto):
     """collect metirics"""
-    metrics = output.meta_info.pop("metrics")  # List[Dict[str, str]]
-    processing_times_list = [item["generate_sequences"] for item in metrics]
-    tool_calls_times_list = [item["tool_calls"] for item in metrics]
-    output.non_tensor_batch["processing_times"] = processing_times_list
-    output.non_tensor_batch["tool_calls_times"] = tool_calls_times_list
+    metrics_list = output.meta_info.pop("metrics")  # List[Dict[str, Any]]
+    output.non_tensor_batch["processing_times"] = np.asarray(
+        [item["generate_sequences"] for item in metrics_list], dtype=np.float64
+    )
+    output.non_tensor_batch["tool_calls_times"] = np.asarray(
+        [item["tool_calls"] for item in metrics_list], dtype=np.float64
+    )
+    output.non_tensor_batch["compute_score_times"] = np.asarray(
+        [float(item.get("compute_score") or 0.0) for item in metrics_list], dtype=np.float64
+    )
+    output.non_tensor_batch["num_preempted_vals"] = np.asarray(
+        [float(item.get("num_preempted", -1)) for item in metrics_list], dtype=np.float64
+    )
+
+    extra_keys: set[str] = set()
+    for m in metrics_list:
+        extra_keys.update(m.keys())
+    extra_keys -= _AGENT_LOOP_STANDARD_METRIC_KEYS
+    for key in sorted(extra_keys):
+        output.non_tensor_batch[f"_al_timing_{key}"] = np.asarray(
+            [float(m.get(key) or 0.0) for m in metrics_list], dtype=np.float64
+        )
+
     return output
 
 
@@ -129,7 +220,6 @@ def assemble_batch_from_rollout_samples(
         final_batch.meta_info["global_token_num"] = torch.sum(final_batch.batch["attention_mask"], dim=-1).tolist()
 
     processing_times = final_batch.non_tensor_batch["processing_times"]
-    tool_calls = final_batch.non_tensor_batch["tool_calls_times"]
     # Collect statistics
     processing_time_stats = {
         "processing_time/avg": np.mean(processing_times),
@@ -139,14 +229,15 @@ def assemble_batch_from_rollout_samples(
         "processing_time/tp99": np.percentile(processing_times, 99),
         "processing_time/tp95": np.percentile(processing_times, 95),
     }
-    tool_calls_stats = {}
-    if len(tool_calls) > 0:
-        tool_calls_stats = {
-            "timing_s/agent_loop/tool_calls/max": np.max(tool_calls),
-            "timing_s/agent_loop/tool_calls/min": np.min(tool_calls),
-            "timing_s/agent_loop/tool_calls/mean": np.mean(tool_calls),
-        }
     processing_time_stats = {f"fully_async/{key}": value for key, value in processing_time_stats.items()}
+
+    # Align with ``AgentLoopManager._performance_metrics`: Harbor / extra agent-loop timings → log.
+    agent_loop_timing_meta = _aggregate_agent_loop_timing_meta(final_batch)
+    for nk in list(final_batch.non_tensor_batch.keys()):
+        if nk.startswith("_al_timing_"):
+            final_batch.non_tensor_batch.pop(nk, None)
+    for nk in ("compute_score_times", "num_preempted_vals"):
+        final_batch.non_tensor_batch.pop(nk, None)
 
     param_version_start = final_batch.non_tensor_batch["min_global_steps"]
     param_version_end = final_batch.non_tensor_batch["max_global_steps"]
@@ -167,7 +258,7 @@ def assemble_batch_from_rollout_samples(
             **processing_time_stats,
             **rollout_status,
             **partial_stats,
-            **tool_calls_stats,
+            **agent_loop_timing_meta,
         }
     )
 

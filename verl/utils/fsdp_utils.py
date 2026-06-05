@@ -1041,6 +1041,65 @@ def merged_lora_context(actor, backup_adapters=False):
             fsdp_merge_unmerge(actor, do_merge=False)
 
 
+def fsdp1_sharded_save_to_cpu(
+    model: torch.nn.Module,
+) -> dict[str, torch.Tensor]:
+    """
+    Sharded Save for FSDP1: Each process saves its local FlatParameter shards to CPU memory.
+
+    Args:
+        model: FSDP1-wrapped model (using FlatParameter).
+
+    Returns:
+        cpu_sharded_state: Dictionary of CPU shards for the current process.
+                          Key = parameter name, Value = CPU tensor
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    assert isinstance(model, FSDP), "Model must be wrapped with FSDP1 (FullyShardedDataParallel)"
+
+    # Initialize FSDP if not already done
+    _lazy_init(model, model)
+
+    cpu_sharded_state = {}
+
+    # Save full state dict (sharded) to CPU
+    # FSDP1 uses FlatParameter, so we use state_dict() which returns sharded state by default
+    state_dict = model.state_dict()
+
+    for param_name, param_tensor in state_dict.items():
+        # Move to CPU and detach
+        cpu_tensor = param_tensor.detach().cpu()
+        cpu_sharded_state[param_name] = cpu_tensor
+
+    return cpu_sharded_state
+
+
+def fsdp1_sharded_load_from_cpu(
+    model: torch.nn.Module,
+    cpu_sharded_state: dict[str, torch.Tensor],
+) -> None:
+    """
+    Sharded Load for FSDP1: Each process loads its CPU shard back to GPU.
+
+    Args:
+        model: FSDP1 model to be restored.
+        cpu_sharded_state: Shard data read from CPU memory by the current process.
+    """
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+
+    assert isinstance(model, FSDP), "Model must be wrapped with FSDP1 (FullyShardedDataParallel)"
+
+    # Initialize FSDP if not already done
+    _lazy_init(model, model)
+
+    # Load the sharded state dict
+    model.load_state_dict(cpu_sharded_state)
+
+    # Process synchronization
+    dist.barrier()
+
+
 def fsdp2_sharded_save_to_cpu(
     model: torch.nn.Module,
 ) -> tuple[dict[str, tuple[torch.Tensor, DTensorSpec]], DTensorSpec]:

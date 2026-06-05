@@ -367,26 +367,77 @@ class FullyAsyncLLMServerManager(LLMServerManager):
 
 
 class FullyAsyncAgentLoopManager(AgentLoopManager):
+    def __init__(
+        self,
+        config: DictConfig,
+        llm_client: LLMServerClient,
+        teacher_client: dict[str, LLMServerClient] = None,
+        reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
+    ):
+        super().__init__(config, llm_client, teacher_client, reward_loop_worker_handles)
+        self._worker_queue: Optional[asyncio.Queue] = None
+        self._worker_queue_lock = asyncio.Lock()
+
+    async def _init_worker_queue(self) -> asyncio.Queue:
+        """Initialize worker queue lazily."""
+        async with self._worker_queue_lock:
+            if self._worker_queue is None:
+                self._worker_queue = asyncio.Queue()
+                for worker in self.agent_loop_workers:
+                    await self._worker_queue.put(worker)
+        return self._worker_queue
+
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 
         Args:
-            prompts (DataProto): Input batch. Single sample data
+            prompts (DataProto): Input batch.
         Returns:
             DataProto: Output batch.
         """
-        worker = self._select_best_worker()
-        output_future = worker.generate_sequences.remote(prompts)
-        return await asyncio.wrap_future(output_future.future())
+        # Split to single-sample tasks and dispatch at worker granularity.
+        queue = await self._init_worker_queue()
+        single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
 
-    def _select_best_worker(self):
-        """Select the best worker, simple round-robin load balancing"""
-        if not hasattr(self, "_worker_index"):
-            self._worker_index = 0
+        async def process_task(sample: DataProto) -> DataProto:
+            worker = await queue.get()
+            try:
+                output_future = worker.generate_sequences.remote(sample)
+                result = await asyncio.wrap_future(output_future.future())
+                return result
+            finally:
+                # Always return worker to queue after task completes or fails.
+                await queue.put(worker)
+                queue.task_done()
 
-        worker = self.agent_loop_workers[self._worker_index]
-        self._worker_index = (self._worker_index + 1) % len(self.agent_loop_workers)
-        return worker
+        outputs = await asyncio.gather(*[process_task(sample) for sample in single_samples])
+        return self._concat_outputs_same_metrics_layout(outputs)
+
+    async def _select_best_worker(self):
+        """Select an idle worker from queue (deprecated, use queue directly)."""
+        queue = await self._init_worker_queue()
+        return await queue.get()
+
+    def _concat_outputs_same_metrics_layout(self, outputs: list[DataProto]) -> DataProto:
+        """Merge rollout shards like :meth:`DataProto.concat`, then restore ``meta_info["metrics"]``.
+
+        ``DataProto.concat`` turns per-sample metric dicts into columnar ``dict[str, list]``.
+        A single worker processing a whole batch leaves ``metrics`` as ``list[dict]``.
+        Fully-async splits work across workers and concatenates; without this step,
+        downstream code that assumes ``list[dict]`` (same as one-shot batch rollout)
+        would see a different shape.
+        """
+        merged = DataProto.concat(outputs)
+        m = merged.meta_info.get("metrics")
+        if not isinstance(m, dict) or not m:
+            return merged
+        keys = list(m.keys())
+        lengths = [len(m[k]) for k in keys]
+        if not lengths or min(lengths) != max(lengths):
+            return merged
+        n = lengths[0]
+        merged.meta_info["metrics"] = [{k: m[k][i] for k in keys} for i in range(n)]
+        return merged
 
 
 @ray.remote(num_cpus=10, max_concurrency=100)
@@ -538,7 +589,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                 / (self.required_samples * self.config.async_training.trigger_parameter_sync_step)
             )
 
-            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 16
+            self.max_concurrent_samples = len(self.llm_server_manager.get_replicas()) * 32
             self.max_concurrent_samples = min(self.max_concurrent_samples, self.max_required_samples)
             self.max_queue_size = self.max_required_samples
 
@@ -818,6 +869,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         for epoch, batch_dict in continuous_iterator:
             # Similar to _prepare_generate_batch: Separate data
             full_batch = prepare_single_generation_data(batch_dict, self.config)
+            full_batch.meta_info["global_steps"] = self.global_steps
 
             sample_id = f"sample_{epoch}_{self.global_steps}"
 
