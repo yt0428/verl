@@ -42,6 +42,47 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 _R3_REPLAY_LOGGED = 0
+_R3_DIAG_N = 0
+# Alignment/gating probe ([R3-DIAG]) is off by default; set R3_DIAG=1 to re-enable
+# (it confirmed the rollout off-by-one: shift-1 overlap 0.99 vs 0.08 unshifted).
+_R3_DIAG_ON = os.getenv("R3_DIAG", "0") == "1"
+
+
+def _r3_print_diag(n_tokens, real, replay_idx, model_topk, gating_gathered):
+    """Systematic R3 alignment/gating probe (print: logger isn't captured in ray
+    actors / vLLM EngineCore). At step 1 actor weights == rollout weights, so for
+    the REAL (non-placeholder) rows a CORRECT replay should overlap the model's
+    own top-k heavily (~0.9+). Interpretation:
+      - overlap≈k/256 (random) and no +/-1 shift recovers it -> token misalignment.
+      - a +1 or -1 token-shift recovers a high overlap            -> off-by-one.
+      - overlap high but pearson still low                        -> gating math.
+    gate_rowsum_mean (sum of the forced experts' current probs = the renorm
+    denominator) is large (~0.5+) when the forced experts are genuinely high-prob
+    (aligned) and tiny (~0.03) when near-random (misaligned)."""
+    with torch.no_grad():
+        rm = real.squeeze(-1)  # [n] bool
+        n_real = int(rm.sum())
+        if n_real == 0:
+            print(f"[R3-DIAG] n_tok={n_tokens} real=0 (all placeholder)", flush=True)
+            return
+        k = replay_idx.shape[-1]
+
+        def _overlap(a):  # mean fraction of a's experts present in model_topk, over real rows
+            m = (a.unsqueeze(-1) == model_topk.unsqueeze(-2)).any(-1).float().sum(-1)  # [n]
+            return float((m[rm] / k).mean())
+
+        ov0, ovp1, ovm1 = _overlap(replay_idx), _overlap(torch.roll(replay_idx, 1, dims=0)), _overlap(
+            torch.roll(replay_idx, -1, dims=0)
+        )
+        t1 = float((replay_idx[rm, 0] == model_topk[rm, 0]).float().mean())
+        gw = gating_gathered[rm]
+        print(
+            f"[R3-DIAG] n_tok={n_tokens} real={n_real} placeholder={n_tokens - n_real} "
+            f"overlap(forced,model_topk)={ov0:.3f} shift+1={ovp1:.3f} shift-1={ovm1:.3f} "
+            f"top1match={t1:.3f} gate_rowsum_mean={float(gw.sum(-1).mean()):.4f} "
+            f"gate_max_mean={float(gw.max(-1).values.mean()):.4f}",
+            flush=True,
+        )
 
 
 def _make_r3_router_forward(orig_forward):
@@ -78,7 +119,8 @@ def _make_r3_router_forward(orig_forward):
             if target.shape[0] == n_tokens:
                 replay_idx = target.to(router_indices.device).long()  # [n, k]
                 real = (replay_idx != 0).any(dim=-1, keepdim=True)  # placeholder rows -> False
-                router_indices = torch.where(real, replay_idx, router_indices)
+                _model_topk = router_indices  # model's own top-k (pre-override) for diagnostics
+                router_indices = torch.where(real, replay_idx, _model_topk)
                 router_top_value = router_probs.gather(-1, router_indices)
                 global _R3_REPLAY_LOGGED
                 if _R3_REPLAY_LOGGED < 5:  # proof the training-side replay actually executed
@@ -88,6 +130,13 @@ def _make_r3_router_forward(orig_forward):
                         n_tokens,
                         int(real.sum()),
                     )
+                global _R3_DIAG_N
+                if _R3_DIAG_ON and _R3_DIAG_N < 8:
+                    _R3_DIAG_N += 1
+                    try:
+                        _r3_print_diag(n_tokens, real, replay_idx, _model_topk, router_top_value)
+                    except Exception as _e:  # never let the probe break training
+                        print(f"[R3-DIAG] probe error: {_e}", flush=True)
             else:
                 logger.warning(
                     "R3 replay token count %d != router tokens %d; skipping replay this forward "

@@ -1313,9 +1313,31 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     )  # (total_nnz, num_layers, topk)
                     _nnz = model_inputs["input_ids"].shape[-1]
                     if _rf.shape[0] == _nnz and _rf.shape[1] == len(RouterReplay.router_instances):
+                        # R3 off-by-one fix: vLLM records the routing of the forward that
+                        # GENERATED each token (sequence position i-1); the agent loop places
+                        # it at the token's own position i. Training applies routing[j] at
+                        # position j's forward — which produced token j+1 — so it must use
+                        # routing[j+1]. Shift -1 to realign. ([R3-DIAG]: shift-1 overlap 0.99
+                        # vs 0.08 unshifted.) NOTE: a global roll is exact only for 1-sequence
+                        # micro-batches (use_dynamic_bsz=False); packed multi-seq batches need
+                        # a per-cu_seqlens roll (otherwise 1 boundary token leaks per sequence).
+                        _rf = torch.roll(_rf, shifts=-1, dims=0)
                         RouterReplay.set_replay_data([_rf[:, _l, :] for _l in range(_rf.shape[1])])
                         RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
                         _r3_armed = True
+                        _ed = getattr(self, "_r3_eng_diag", 0)
+                        if _ed < 2 and os.getenv("R3_DIAG") == "1":  # [R3-ENG] structure probe (set R3_DIAG=1)
+                            self._r3_eng_diag = _ed + 1
+                            _rmask = micro_batch.get("response_mask", None)
+                            _rmsum = int(_rmask.sum()) if _rmask is not None else -1
+                            _nz = int((_rf.reshape(_rf.shape[0], -1) != 0).any(dim=-1).sum())
+                            print(
+                                f"[R3-ENG] is_nested={getattr(_routed, 'is_nested', False)} "
+                                f"rf_shape={tuple(_rf.shape)} nnz={_nnz} layers={_rf.shape[1]} "
+                                f"routers={len(RouterReplay.router_instances)} nonzero_rows={_nz} "
+                                f"response_mask_sum={_rmsum}",
+                                flush=True,
+                            )
                     else:
                         logger.warning(
                             "R3: replay shape mismatch (tokens %d vs %d, layers %d vs %d); skipping replay.",
