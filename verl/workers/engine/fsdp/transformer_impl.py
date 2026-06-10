@@ -297,6 +297,20 @@ class FSDPEngine(BaseEngine):
                 fused_kernels_backend=fused_kernels_backend,
             )
 
+            # R3 (rollout routing replay) for the FSDP path: patch the HF Qwen3.5-MoE
+            # router so training can replay rollout's expert selection. Only when
+            # router_replay is enabled and this is a Qwen3.5-MoE model. DRAFT: needs
+            # GPU validation (see _maybe_set_router_replay).
+            _rr_cfg = getattr(self.engine_config, "router_replay", None)
+            if (
+                getattr(_rr_cfg, "mode", "disabled") != "disabled"
+                and getattr(module.config, "model_type", None) == "qwen3_5_moe"
+            ):
+                from verl.models.transformers.qwen3_5_router_replay import apply_qwen3_5_router_replay_patch
+
+                n_gates = apply_qwen3_5_router_replay_patch(module)
+                logger.info("R3: patched %d Qwen3.5-MoE router gate(s) for replay", n_gates)
+
             # some parameters may not in torch_dtype
             module.to(torch_dtype)
 
@@ -1267,10 +1281,53 @@ class FSDPEngineWithLMHead(FSDPEngine):
             else torch.autocast(device_type=device_name, dtype=autocast_dtype)
         )
         with autocast_ctx:
-            raw_output = self.module(
-                **model_inputs,
-                use_cache=False,
-            )  # prevent model thinks we are generating
+            # R3 (rollout routing replay) — DRAFT, NEEDS GPU VALIDATION.
+            # Arm replay for this forward: force the MoE router to rollout's recorded
+            # expert selection (gating weights still recomputed from current logits).
+            # routed_experts must be packed in the SAME remove-padding order as
+            # input_ids; if the shapes don't line up we skip + warn rather than
+            # silently corrupt. Gated on router_replay.mode and sp_size==1 (Ulysses SP
+            # pads/slices the sequence and breaks the alignment + the GDN layers).
+            _r3_armed = False
+            _rr_cfg = getattr(self.engine_config, "router_replay", None)
+            _routed = micro_batch.get("routed_experts", None)
+            if (
+                getattr(_rr_cfg, "mode", "disabled") != "disabled"
+                and _routed is not None
+                and self.ulysses_sequence_parallel_size == 1
+            ):
+                from verl.utils.router_replay import RouterReplay, RouterReplayAction
+
+                if RouterReplay.router_instances:
+                    _rf = (
+                        _routed.values()
+                        if getattr(_routed, "is_nested", False)
+                        else _routed.reshape(-1, _routed.shape[-2], _routed.shape[-1])
+                    )  # (total_nnz, num_layers, topk)
+                    _nnz = model_inputs["input_ids"].shape[-1]
+                    if _rf.shape[0] == _nnz and _rf.shape[1] == len(RouterReplay.router_instances):
+                        RouterReplay.set_replay_data([_rf[:, _l, :] for _l in range(_rf.shape[1])])
+                        RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+                        _r3_armed = True
+                    else:
+                        logger.warning(
+                            "R3: replay shape mismatch (tokens %d vs %d, layers %d vs %d); skipping replay.",
+                            _rf.shape[0],
+                            _nnz,
+                            _rf.shape[1],
+                            len(RouterReplay.router_instances),
+                        )
+            try:
+                raw_output = self.module(
+                    **model_inputs,
+                    use_cache=False,
+                )  # prevent model thinks we are generating
+            finally:
+                if _r3_armed:
+                    from verl.utils.router_replay import RouterReplay
+
+                    RouterReplay.clear_global_router_replay_action()
+                    RouterReplay.clear_global_indices()
 
             model_output = self.prepare_model_outputs(
                 output=raw_output, output_args=output_args, micro_batch=micro_batch, logits_processor_func=loss_function
