@@ -1284,18 +1284,17 @@ class FSDPEngineWithLMHead(FSDPEngine):
             # R3 (rollout routing replay) — DRAFT, NEEDS GPU VALIDATION.
             # Arm replay for this forward: force the MoE router to rollout's recorded
             # expert selection (gating weights still recomputed from current logits).
+            # Gated on the upstream `enable_routing_replay` non-tensor flag (set by the
+            # TrainingWorker's _with_routing_replay_flag decorator on actor_* methods,
+            # so ref-policy passes get enabled=False), mirroring the Megatron engine.
             # routed_experts must be packed in the SAME remove-padding order as
             # input_ids; if the shapes don't line up we skip + warn rather than
-            # silently corrupt. Gated on router_replay.mode and sp_size==1 (Ulysses SP
-            # pads/slices the sequence and breaks the alignment + the GDN layers).
+            # silently corrupt. sp_size==1 only (Ulysses SP pads/slices the sequence
+            # and breaks both the alignment and the GDN layers).
             _r3_armed = False
-            _rr_cfg = getattr(self.engine_config, "router_replay", None)
+            _rr_enabled = tu.get_non_tensor_data(micro_batch, key="enable_routing_replay", default=False)
             _routed = micro_batch.get("routed_experts", None)
-            if (
-                getattr(_rr_cfg, "mode", "disabled") != "disabled"
-                and _routed is not None
-                and self.ulysses_sequence_parallel_size == 1
-            ):
+            if _rr_enabled and _routed is not None and self.ulysses_sequence_parallel_size == 1:
                 from verl.utils.router_replay import RouterReplay, RouterReplayAction
 
                 if RouterReplay.router_instances:
