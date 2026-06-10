@@ -302,14 +302,22 @@ class FSDPEngine(BaseEngine):
             # router_replay is enabled and this is a Qwen3.5-MoE model. DRAFT: needs
             # GPU validation (see _maybe_set_router_replay).
             _rr_cfg = getattr(self.engine_config, "router_replay", None)
-            if (
-                getattr(_rr_cfg, "mode", "disabled") != "disabled"
-                and getattr(module.config, "model_type", None) == "qwen3_5_moe"
-            ):
+            _rr_mode = getattr(_rr_cfg, "mode", "disabled")
+            if _rr_mode != "disabled":
                 from verl.models.transformers.qwen3_5_router_replay import apply_qwen3_5_router_replay_patch
 
+                # Patch whatever Qwen3.5-MoE router gates exist on the module
+                # (returns 0 for non-Qwen3.5 models, harmless). Keying off the
+                # actual router modules rather than a config.model_type string is
+                # robust to multimodal/nested configs (e.g. model_type reported as
+                # 'qwen3_5_moe_text' on the language sub-config).
                 n_gates = apply_qwen3_5_router_replay_patch(module)
-                logger.info("R3: patched %d Qwen3.5-MoE router gate(s) for replay", n_gates)
+                logger.warning(
+                    "[R3] engine build: patched %d Qwen3.5-MoE router gate(s) (mode=%s, model_type=%s)",
+                    n_gates,
+                    _rr_mode,
+                    getattr(module.config, "model_type", None),
+                )
 
             # some parameters may not in torch_dtype
             module.to(torch_dtype)
@@ -1316,6 +1324,16 @@ class FSDPEngineWithLMHead(FSDPEngine):
                             _rf.shape[1],
                             len(RouterReplay.router_instances),
                         )
+            if _rr_enabled and not _r3_armed:
+                from verl.utils.router_replay import RouterReplay as _RR_DIAG
+
+                logger.warning(
+                    "[R3] forward: replay NOT armed — enabled=%s routed_experts_present=%s sp=%d router_instances=%d",
+                    _rr_enabled,
+                    _routed is not None,
+                    self.ulysses_sequence_parallel_size,
+                    len(_RR_DIAG.router_instances),
+                )
             try:
                 raw_output = self.module(
                     **model_inputs,

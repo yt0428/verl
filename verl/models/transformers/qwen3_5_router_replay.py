@@ -97,8 +97,13 @@ def _make_r3_router_forward(orig_forward):
                 )
 
         router_top_value = router_top_value / router_top_value.sum(dim=-1, keepdim=True)
-        router_top_value = router_top_value.to(router_logits.dtype)
-        return router_logits, router_top_value, router_indices
+        # Match the stock Qwen3_5MoeTopKRouter.forward, which reassigns
+        # ``router_logits = softmax(router_logits, dtype=float)`` and then returns
+        # that (float32) tensor and casts the scores to ITS dtype. Returning the
+        # raw bf16 logits / bf16 scores here would diverge from the unpatched
+        # router on every non-replayed row (gating weights in bf16 vs float32).
+        router_top_value = router_top_value.to(router_probs.dtype)
+        return router_probs, router_top_value, router_indices
 
     return _r3_router_forward
 
