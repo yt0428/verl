@@ -418,6 +418,33 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         queue = await self._init_worker_queue()
         return await queue.get()
 
+    @staticmethod
+    def _align_rollout_shard_keys(outputs: list[DataProto]) -> list[DataProto]:
+        """Make every rollout shard carry the same TensorDict keys before ``torch.cat``.
+
+        Shards differ in keys when a tensor is produced only by some trials — e.g.
+        ``routed_experts`` (R3 MoE routing) is present only when routing was actually
+        captured; empty/failed trials omit it. ``DataProto.concat`` -> ``torch.cat``
+        requires identical key sets, so pad any key present in some shards but not all
+        with zeros. Model-agnostic: the missing tensor's shape/dtype/device are copied
+        from a shard that has it (only the batch dim varies), so no per-model constants
+        (num_layers/topk) are needed and it works regardless of how trials map to workers.
+        """
+        shards = [o for o in outputs if o is not None and getattr(o, "batch", None) is not None]
+        if len(shards) <= 1:
+            return outputs
+        ref = {}
+        for o in shards:
+            for k in o.batch.keys():
+                ref.setdefault(k, o.batch[k])
+        for o in shards:
+            present = set(o.batch.keys())
+            n = o.batch.batch_size[0]
+            for k, t in ref.items():
+                if k not in present:
+                    o.batch[k] = torch.zeros((n, *t.shape[1:]), dtype=t.dtype, device=t.device)
+        return outputs
+
     def _concat_outputs_same_metrics_layout(self, outputs: list[DataProto]) -> DataProto:
         """Merge rollout shards like :meth:`DataProto.concat`, then restore ``meta_info["metrics"]``.
 
@@ -427,6 +454,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         downstream code that assumes ``list[dict]`` (same as one-shot batch rollout)
         would see a different shape.
         """
+        outputs = self._align_rollout_shard_keys(outputs)
         merged = DataProto.concat(outputs)
         m = merged.meta_info.get("metrics")
         if not isinstance(m, dict) or not m:
