@@ -80,7 +80,15 @@ class DetachActorWorker(ActorRolloutRefWorker):
         # save/restore. The current fsdp2_sharded_save_to_cpu / fsdp2_sharded_load_from_cpu
         # assume parameters are on GPU. Callers should ensure the model is loaded back to GPU
         # before calling save_model_to_cpu / restore_model_from_cpu in offload scenarios.
-        if strategy in ["fsdp", "fsdp2", "veomni"]:
+        if strategy == "fsdp":
+            # FSDP1 uses FlatParameter (not DTensor)
+            from verl.utils.fsdp_utils import (
+                fsdp1_sharded_load_from_cpu,
+                fsdp1_sharded_save_to_cpu,
+            )
+
+            self._strategy_handlers = (fsdp1_sharded_save_to_cpu, fsdp1_sharded_load_from_cpu)
+        elif strategy in ["fsdp2", "veomni"]:
             from verl.utils.fsdp_utils import (
                 fsdp2_sharded_load_from_cpu,
                 fsdp2_sharded_save_to_cpu,
@@ -141,7 +149,11 @@ class DetachActorWorker(ActorRolloutRefWorker):
         if n in self.cpu_saved_models:
             strategy = self.config.actor.strategy
 
-            if strategy in ["fsdp", "fsdp2", "veomni"]:
+            if strategy == "fsdp":
+                # FSDP1: saved state is a dict[str, torch.Tensor]
+                cpu_sharded_state = self.cpu_saved_models[n]
+                self.restore_handler(self.actor.engine.module, cpu_sharded_state)
+            elif strategy in ["fsdp2", "veomni"]:
                 cpu_sharded_state, global_spec = self.cpu_saved_models[n]
                 self.restore_handler(self.actor.engine.module, cpu_sharded_state, global_spec)
             else:

@@ -21,6 +21,7 @@ import threading
 from types import MethodType
 from typing import Any, Literal, Optional, get_args
 
+import numpy as np
 import torch
 from vllm.outputs import RequestOutput
 
@@ -391,5 +392,5 @@ def extract_prompt_logprobs(output: RequestOutput, num_prompt_logprobs: Optional
     prompt_logprobs_ls.append([0.0] * max(num_prompt_logprobs, 1))
     prompt_ids_ls.append([0] * max(num_prompt_logprobs, 1))
 
-    result_dict["prompt_ids"] = prompt_ids_ls
-    result_dict["prompt_logprobs"] = prompt_logprobs_ls
+    result_dict["prompt_ids"] = np.array(prompt_ids_ls, dtype=np.int32)
+    result_dict["prompt_logprobs"] = np.array(prompt_logprobs_ls, dtype=np.float32)
