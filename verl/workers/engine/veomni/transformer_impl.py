@@ -972,58 +972,40 @@ class VeOmniEngineWithLMHead(VeOmniEngine, FSDPEngineWithLMHead):
             # prompt tokens out and let them go through native routing.
             replay_mask = None
             if self._router_replay_mode == "R3":
+                # Per-rmpad-token bool mask in the SAME [total_nnz] layout as
+                # ``routed_experts.values()``: a token participates in replay
+                # iff its routing row is non-zero, i.e. the rollout backend
+                # actually recorded it. The previous construction derived
+                # ``[prompt_lens zeros, response_lens ones]`` from
+                # ``response_mask.sum()`` — that assumes the recorded tokens
+                # form one contiguous tail, which only holds for single-turn
+                # data. Multi-turn agent trajectories interleave generated
+                # tokens with injected tool-result tokens (zero placeholders)
+                # inside the response region, so the length-based boundary
+                # lands mid-sequence: tail placeholders get replayed as
+                # expert 0 while earlier recorded tokens fall back to native
+                # routing (observed as pearson 0.9969 -> 0.8486 on SWE data).
+                # Row-content detection is layout-agnostic and matches the
+                # FSDP-path placeholder semantics exactly.
+                mask_flat = flat.reshape(flat.size(0), -1).ne(0).any(dim=-1)
+                # Consistency probe: response_mask marks the tokens the
+                # rollout backend generated, so its sum should equal the
+                # number of recorded rows. A mismatch means the routing
+                # tensor and the batch disagree (placement/plumbing drift) —
+                # warn loudly but keep the row-content mask, which is the
+                # ground truth of what was actually recorded.
                 response_mask = micro_batch.get("response_mask", None)
-                if response_mask is None:
-                    raise RuntimeError(
-                        "router_replay R3: micro_batch missing 'response_mask'. "
-                        "R3 needs the response_mask to know which tokens have "
-                        "real recorded routing (response) vs. zero placeholders "
-                        "(prompt). Verify left_right_2_no_padding preserved it."
-                    )
-                # Build a per-rmpad-token bool mask in the SAME [total_nnz]
-                # layout as ``input_ids.values()`` (also matches
-                # ``routed_experts.values()`` since they share the same
-                # ``index_first_axis(unpad_input(input_ids).indices)``
-                # transform): per sample i, ``prompt_lens[i]`` zeros
-                # followed by ``response_lens[i]`` ones.
-                #
-                # We CANNOT use ``micro_batch['loss_mask']`` directly —
-                # after ``left_right_2_no_padding`` it's still a strided
-                # ``(bs, max_response_len)`` tensor (not nested), which
-                # neither has the right shape nor a valid ``.values()``
-                # for a strided layout.
-                total_lens = input_ids.offsets().diff()  # (bs,)
-                response_lens = response_mask.sum(dim=-1).to(total_lens.dtype)  # (bs,)
-                prompt_lens = total_lens - response_lens  # (bs,)
-                # Defensive: response_lens > total_lens means the
-                # response_mask describes more tokens than the input has,
-                # which is data corruption. Failing here surfaces a clear
-                # message instead of letting repeat_interleave silently
-                # produce a malformed mask.
-                if torch.any(prompt_lens < 0):
-                    raise RuntimeError(
-                        f"router_replay R3: response_mask sum exceeds total token "
-                        f"count for some samples — prompt_lens={prompt_lens.tolist()}. "
-                        "Likely cause: response_mask was not aligned with the "
-                        "input_ids the actor sees (rollout/trainer plumbing bug)."
-                    )
-                bs = total_lens.size(0)
-                # values=[0, 1, 0, 1, ...] (length 2*bs), counts=[p_0, r_0, p_1, r_1, ...]
-                values = torch.tensor([False, True], dtype=torch.bool, device=total_lens.device).repeat(bs)
-                counts = torch.stack([prompt_lens, response_lens], dim=1).flatten()
-                mask_flat = torch.repeat_interleave(values, counts)
-                # Defensive: the constructed mask must align with
-                # routed_experts at the rmpad layer, otherwise the
-                # downstream ``torch.where(mask, target, native)`` would
-                # silently misalign and the EP all-to-all would still
-                # blow up. Fail-fast here with a clearer message.
-                if mask_flat.numel() != flat.size(0):
-                    raise RuntimeError(
-                        f"router_replay R3: constructed replay_mask has "
-                        f"{mask_flat.numel()} entries but routed_experts.values() "
-                        f"has {flat.size(0)}. response_mask + input_ids.offsets() "
-                        "do not describe the same total token count."
-                    )
+                if response_mask is not None:
+                    _n_recorded = int(mask_flat.sum())
+                    _n_response = int(response_mask.sum())
+                    if _n_recorded != _n_response:
+                        logger.warning(
+                            "router_replay R3: recorded routing rows (%d) != response_mask sum (%d); "
+                            "replaying the %d recorded rows only.",
+                            _n_recorded,
+                            _n_response,
+                            _n_recorded,
+                        )
                 # Mirror the same pad+slice rule used for routed_experts.
                 replay_mask = rr.slice_microbatch_replay_mask(mask_flat)
 

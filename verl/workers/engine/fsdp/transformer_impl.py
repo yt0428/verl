@@ -1313,15 +1313,14 @@ class FSDPEngineWithLMHead(FSDPEngine):
                     )  # (total_nnz, num_layers, topk)
                     _nnz = model_inputs["input_ids"].shape[-1]
                     if _rf.shape[0] == _nnz and _rf.shape[1] == len(RouterReplay.router_instances):
-                        # R3 off-by-one fix: vLLM records the routing of the forward that
-                        # GENERATED each token (sequence position i-1); the agent loop places
-                        # it at the token's own position i. Training applies routing[j] at
-                        # position j's forward — which produced token j+1 — so it must use
-                        # routing[j+1]. Shift -1 to realign. ([R3-DIAG]: shift-1 overlap 0.99
-                        # vs 0.08 unshifted.) NOTE: a global roll is exact only for 1-sequence
-                        # micro-batches (use_dynamic_bsz=False); packed multi-seq batches need
-                        # a per-cu_seqlens roll (otherwise 1 boundary token leaks per sequence).
-                        _rf = torch.roll(_rf, shifts=-1, dims=0)
+                        # No shift here: harbor's _build_routed_experts stores each
+                        # captured row at the position of the forward that produced
+                        # it (token position - 1), so routed_experts[j] is already
+                        # the routing of position j's forward. The previous
+                        # ``torch.roll(_rf, -1)`` compensated for the old
+                        # token-position placement and would now double-shift; the
+                        # roll was also only exact for 1-sequence micro-batches, a
+                        # limitation the assembly-side placement removes.
                         RouterReplay.set_replay_data([_rf[:, _l, :] for _l in range(_rf.shape[1])])
                         RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
                         _r3_armed = True
