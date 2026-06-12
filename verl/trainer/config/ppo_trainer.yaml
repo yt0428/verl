@@ -39,6 +39,9 @@ defaults:
   # Rollout correction config.
   - algorithm@algorithm.rollout_correction: rollout_correction
 
+  # Trajectory filter config (mask env-corrupted trajectories out of loss/group stats).
+  - algorithm@algorithm.trajectory_filter: trajectory_filter
+
   # distillation config
   - distillation@distillation: distillation
 
