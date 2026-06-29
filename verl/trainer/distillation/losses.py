@@ -209,14 +209,16 @@ def distillation_ppo_loss(
     distill_loss, distill_metrics = distillation_loss(config, distillation_config, model_output, data)
     policy_loss, policy_metrics = ppo_loss(config, model_output, data, dp_group)
     if not distillation_loss_config.use_task_rewards:
-        policy_loss = 0.0
+        policy_loss_coef = 0.0
+    else:
+        policy_loss_coef = 1.0
 
     # Combine distillation with policy loss
     policy_metrics.update(distill_metrics)
     distillation_loss_coef = (
         distillation_loss_config.distillation_loss_coef if distillation_loss_config.use_task_rewards else 1.0
     )
-    policy_loss += distill_loss * distillation_loss_coef
+    policy_loss = policy_loss * policy_loss_coef + distill_loss * distillation_loss_coef
     policy_metrics["distillation/loss"] = Metric(value=distill_loss, aggregation=AggregationType.SUM)
 
     return policy_loss, policy_metrics
