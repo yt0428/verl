@@ -1063,14 +1063,13 @@ def fsdp1_sharded_save_to_cpu(
 
     cpu_sharded_state = {}
 
-    # Save full state dict (sharded) to CPU
-    # FSDP1 uses FlatParameter, so we use state_dict() which returns sharded state by default
-    state_dict = model.state_dict()
-
-    for param_name, param_tensor in state_dict.items():
-        # Move to CPU and detach
-        cpu_tensor = param_tensor.detach().cpu()
-        cpu_sharded_state[param_name] = cpu_tensor
+    # Snapshot each rank's local FlatParameter shards directly instead of going
+    # through state_dict(): the default FULL_STATE_DICT path unshards onto the
+    # compute device, which asserts when CPUOffload(offload_params=True) keeps
+    # the flat parameters on CPU between forwards.
+    with torch.no_grad():
+        for param_name, param in model.named_parameters():
+            cpu_sharded_state[param_name] = param.detach().to("cpu", copy=True)
 
     return cpu_sharded_state
 
@@ -1093,8 +1092,13 @@ def fsdp1_sharded_load_from_cpu(
     # Initialize FSDP if not already done
     _lazy_init(model, model)
 
-    # Load the sharded state dict
-    model.load_state_dict(cpu_sharded_state)
+    # Copy each local shard back in place, mirroring fsdp1_sharded_save_to_cpu.
+    # Works whether the flat parameters currently live on GPU or on CPU
+    # (CPUOffload), unlike load_state_dict() which unshards onto the compute
+    # device.
+    with torch.no_grad():
+        for param_name, param in model.named_parameters():
+            param.data.copy_(cpu_sharded_state[param_name].to(param.device))
 
     # Process synchronization
     dist.barrier()

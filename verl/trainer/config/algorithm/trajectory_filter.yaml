@@ -1,0 +1,30 @@
+# Trajectory filter: mask environment-corrupted trajectories out of the policy loss
+# and GRPO group statistics. See verl.trainer.config.TrajectoryFilterConfig.
+# Flagged trajectories get zeroed token_level_rewards/advantages and a singleton uid;
+# batch shapes are unchanged. Counts logged under trajectory_filter/.
+
+# Master switch (default off: no behavior change)
+enable: false
+
+# Drop env-failure/dummy trajectories (env setup failed, invalid proxy trajectory,
+# response shorter than min_response_tokens)
+filter_env_failures: true
+
+# Drop trajectories flagged is_timeout (agent/verifier wall-clock timeout)
+filter_timeouts: true
+
+# Drop trajectories flagged is_context_error (context-length overflow)
+filter_context_errors: true
+
+# DAPO-style overlong masking: drop trajectories flagged is_overlong or whose
+# response fills the entire response window (truncated by max_response_length)
+filter_overlong: true
+
+# Drop trajectories that exhausted the turn cap (__num_turns__ >= max_num_turns)
+filter_turn_capped: false
+
+# Responses with fewer valid tokens are treated as env failures (0 disables)
+min_response_tokens: 8
+
+# Turn cap used by filter_turn_capped (0 disables)
+max_num_turns: 0

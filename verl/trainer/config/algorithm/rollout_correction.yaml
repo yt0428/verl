@@ -26,3 +26,7 @@ loss_type: ppo_clip
 
 # Batch normalize IS weights: false = raw weights, true = normalize to mean=1.0
 rollout_is_batch_normalize: false
+
+# Log per-sequence distribution (p50/p90/p99, tail fractions) of off-policy metrics
+# (training_log_ppl, log_ppl_diff, log_chi2_seq). Batch means hide catastrophic tails.
+seq_dist_metrics: true

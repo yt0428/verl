@@ -924,6 +924,24 @@ class DataProto:
         Returns:
             DataProto: concatenated DataProto
         """
+        # Align TensorDict keys across shards before torch.cat: a key present in some
+        # shards but not all (e.g. routed_experts, captured only for trials whose MoE
+        # routing R3 recorded; empty/failed trials omit it) makes torch.cat fail with
+        # "incompatible keys". Pad the missing ones with zeros copied from a shard that
+        # has the key (shape/dtype/device; only the batch dim varies) — model-agnostic.
+        # Lives here (not just at call sites) so every concat path is covered.
+        _shards = [d for d in data if d is not None and getattr(d, "batch", None) is not None]
+        if len(_shards) > 1:
+            _ref = {}
+            for _d in _shards:
+                for _k in _d.batch.keys():
+                    _ref.setdefault(_k, _d.batch[_k])
+            for _d in _shards:
+                _present = set(_d.batch.keys())
+                _n = _d.batch.batch_size[0]
+                for _k, _t in _ref.items():
+                    if _k not in _present:
+                        _d.batch[_k] = torch.zeros((_n, *_t.shape[1:]), dtype=_t.dtype, device=_t.device)
         batch_lst = []
         for batch in data:
             batch_lst.append(batch.batch)

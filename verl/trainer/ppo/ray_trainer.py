@@ -1602,6 +1602,19 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
+                        # Mask environment-corrupted trajectories (env failures, timeouts,
+                        # context errors, overlong truncation, turn caps) out of the loss
+                        # and group stats. No-op unless algorithm.trajectory_filter.enable.
+                        from verl.trainer.ppo.trajectory_filter import (
+                            apply_trajectory_filter,
+                            zero_filtered_advantages,
+                        )
+
+                        batch, traj_filter_metrics = apply_trajectory_filter(
+                            batch, self.config.algorithm.get("trajectory_filter", None)
+                        )
+                        metrics.update(traj_filter_metrics)
+
                         # Compute rollout correction: IS weights, rejection sampling, and metrics
                         # Only runs in decoupled mode (computes once per batch using stable π_old)
                         # In bypass mode, this is skipped - actor computes metrics from evolving π_θ vs π_rollout
@@ -1631,6 +1644,9 @@ class RayPPOTrainer:
                             norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
                             config=self.config.algorithm,
                         )
+
+                        # Estimator-agnostic safety net: filtered rows contribute zero gradient.
+                        batch = zero_filtered_advantages(batch)
 
                     # update critic
                     if self.use_critic:

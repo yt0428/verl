@@ -785,6 +785,7 @@ def compute_rollout_correction_and_rejection_mask(
     rollout_is_batch_normalize: bool = False,
     rollout_rs: Optional[str] = None,
     rollout_rs_threshold: Optional[str | float] = None,
+    seq_dist_metrics: bool = False,
 ) -> tuple[Optional[DataProto], torch.Tensor, dict[str, float]]:
     """Unified interface for computing IS weights and rejection masks.
 
@@ -875,6 +876,7 @@ def compute_rollout_correction_and_rejection_mask(
         old_log_prob=old_log_prob,
         rollout_log_prob=rollout_log_prob,
         response_mask=response_mask,
+        seq_dist=seq_dist_metrics,
     )
     metrics.update(offpolicy_metrics)
 
@@ -894,10 +896,20 @@ def compute_rollout_correction_and_rejection_mask(
     return rollout_is_weights_proto, modified_response_mask, metrics_scalar
 
 
+def _seq_dist_stats(metrics: dict[str, Any], name: str, values: torch.Tensor) -> None:
+    """Log p50/p90/p99 of a per-sequence tensor (batch means hide catastrophic tails)."""
+    values = values.detach().float()
+    quantiles = torch.quantile(values, torch.tensor([0.5, 0.9, 0.99], device=values.device))
+    metrics[f"{name}_p50"] = quantiles[0].item()
+    metrics[f"{name}_p90"] = quantiles[1].item()
+    metrics[f"{name}_p99"] = quantiles[2].item()
+
+
 def compute_offpolicy_metrics(
     old_log_prob: torch.Tensor,
     rollout_log_prob: Optional[torch.Tensor],
     response_mask: torch.Tensor,
+    seq_dist: bool = False,
 ) -> dict[str, Any]:
     """Compute off-policy diagnostic metrics (helper function).
 
@@ -925,6 +937,9 @@ def compute_offpolicy_metrics(
         old_log_prob: Log probabilities from training policy, shape (batch_size, seq_length)
         rollout_log_prob: Log probabilities from rollout policy, shape (batch_size, seq_length)
         response_mask: Mask for valid tokens, shape (batch_size, seq_length)
+        seq_dist: Also log per-sequence distribution (p50/p90/p99, tail fractions) of
+            training_log_ppl, log_ppl_diff and log_chi2_seq. Batch means/maxes hide how
+            many sequences sit in the catastrophic tail; these expose it directly.
 
     Returns:
         Dictionary of off-policy metrics (without prefix)
@@ -943,6 +958,9 @@ def compute_offpolicy_metrics(
 
     # Also log log-ppl for easier analysis (avoids exponential scale)
     metrics["training_log_ppl"] = (-mean_log_prob_training).mean().detach().item()
+
+    if seq_dist:
+        _seq_dist_stats(metrics, "training_log_ppl", -mean_log_prob_training)
 
     # 2. Compute rollout off-policy metrics (only if rollout_log_probs available)
     if rollout_log_prob is not None:
@@ -1000,6 +1018,16 @@ def compute_offpolicy_metrics(
         chi2_seq = rho_squared_seq.mean() - 1.0
         metrics["chi2_seq"] = chi2_seq.detach().item()
 
+        if seq_dist:
+            # log_ppl_diff per sequence: the primary early-warning signal — a handful of
+            # sequences the trained policy can no longer produce drive training_ppl and
+            # grad spikes long before batch means move.
+            _seq_dist_stats(metrics, "log_ppl_diff", log_ppl_diff)
+            metrics["log_ppl_diff_gt1_frac"] = (log_ppl_diff > 1.0).float().mean().detach().item()
+            metrics["log_ppl_diff_gt2_frac"] = (log_ppl_diff > 2.0).float().mean().detach().item()
+            # chi2 per sequence in log space (2 * Σ log ρ_t); raw values overflow easily.
+            _seq_dist_stats(metrics, "log_chi2_seq", 2.0 * log_ratio_sum_safe)
+
     return metrics
 
 
@@ -1037,6 +1065,7 @@ def compute_rollout_correction_and_add_to_batch(
     rollout_is_batch_normalize = rollout_corr_config.get("rollout_is_batch_normalize", False)
     rollout_rs = rollout_corr_config.get("rollout_rs", None)
     rollout_rs_threshold = rollout_corr_config.get("rollout_rs_threshold", None)
+    seq_dist_metrics = rollout_corr_config.get("seq_dist_metrics", True)
 
     # Compute IS weights and get modified response_mask
     rollout_is_weights, modified_response_mask, rollout_corr_metrics = compute_rollout_correction_and_rejection_mask(
@@ -1048,6 +1077,7 @@ def compute_rollout_correction_and_add_to_batch(
         rollout_is_batch_normalize=rollout_is_batch_normalize,
         rollout_rs=rollout_rs,
         rollout_rs_threshold=rollout_rs_threshold,
+        seq_dist_metrics=seq_dist_metrics,
     )
 
     # ALWAYS update response_mask with rejection applied

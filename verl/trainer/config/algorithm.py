@@ -17,7 +17,13 @@ from typing import Any, Optional
 
 from verl.base_config import BaseConfig
 
-__all__ = ["AlgoConfig", "FilterGroupsConfig", "KLControlConfig", "RolloutCorrectionConfig"]
+__all__ = [
+    "AlgoConfig",
+    "FilterGroupsConfig",
+    "KLControlConfig",
+    "RolloutCorrectionConfig",
+    "TrajectoryFilterConfig",
+]
 
 
 @dataclass
@@ -54,6 +60,51 @@ class FilterGroupsConfig(BaseConfig):
     enable: bool = False
     metric: Optional[str] = None
     max_num_gen_batches: int = 0
+
+
+@dataclass
+class TrajectoryFilterConfig(BaseConfig):
+    """Mask environment-corrupted trajectories out of the policy loss and group statistics.
+
+    Agentic rollouts can fail for reasons unrelated to policy quality (sandbox/env setup
+    failure, agent or verifier wall-clock timeout, context-length overflow, response-length
+    truncation, turn-cap exhaustion). Such trajectories carry a reward that reflects the
+    environment, not the policy; training on them injects noise into the advantage signal
+    (especially with GRPO std-normalization, where a spurious 0 inflates sibling advantages).
+
+    When enabled, flagged trajectories are excluded from BOTH the policy loss (their
+    advantages/returns are zeroed) and the GRPO group statistics (their uid is rewritten
+    to a singleton group), without changing batch shapes. Per-reason counts are logged
+    under ``trajectory_filter/``.
+
+    Flag sources (agent loop ``extra_fields`` propagated into ``non_tensor_batch``):
+    ``is_env_failure``, ``is_timeout``, ``is_context_error``, ``is_overlong``,
+    ``trajectory_token_source == "dummy"``, plus trainer-side fallbacks (response length
+    below ``min_response_tokens``, response filling the whole window, ``__num_turns__``).
+
+    Args:
+        enable (bool): Master switch. Default False (no behavior change).
+        filter_env_failures (bool): Drop env-failure/dummy trajectories (env setup failed,
+            invalid proxy trajectory, response shorter than ``min_response_tokens``).
+        filter_timeouts (bool): Drop trajectories flagged ``is_timeout`` (agent/verifier
+            wall-clock timeout).
+        filter_context_errors (bool): Drop trajectories flagged ``is_context_error``.
+        filter_overlong (bool): DAPO-style overlong masking — drop trajectories flagged
+            ``is_overlong`` or whose response fills the whole response window (truncated).
+        filter_turn_capped (bool): Drop trajectories with ``__num_turns__ >= max_num_turns``.
+        min_response_tokens (int): Responses with fewer valid tokens are treated as env
+            failures. 0 disables the length check.
+        max_num_turns (int): Turn cap used by ``filter_turn_capped``. 0 disables.
+    """
+
+    enable: bool = False
+    filter_env_failures: bool = True
+    filter_timeouts: bool = True
+    filter_context_errors: bool = True
+    filter_overlong: bool = True
+    filter_turn_capped: bool = False
+    min_response_tokens: int = 8
+    max_num_turns: int = 0
 
 
 @dataclass
@@ -179,6 +230,9 @@ class RolloutCorrectionConfig(BaseConfig):
     rollout_rs_threshold: Optional[str | float] = None
     bypass_mode: bool = False
     loss_type: str = "ppo_clip"
+    # Log per-sequence distribution (p50/p90/p99, tail fractions) of off-policy metrics
+    # (training_log_ppl, log_ppl_diff, chi2_seq). Batch means hide catastrophic tails.
+    seq_dist_metrics: bool = True
 
     @classmethod
     def decoupled_token_is(cls, threshold: float = 2.0) -> "RolloutCorrectionConfig":
@@ -658,6 +712,9 @@ class AlgoConfig(BaseConfig):
     use_pf_ppo: bool = False
     pf_ppo: dict[str, Any] = field(default_factory=dict)
     filter_groups: Optional[FilterGroupsConfig] = None
+    # Trajectory filter: mask environment-corrupted trajectories (env failures, timeouts,
+    # context errors, overlong truncation, turn caps) out of the loss and group statistics.
+    trajectory_filter: Optional[TrajectoryFilterConfig] = None
     # Rollout Correction: corrects off-policy issues (policy mismatch, model staleness, distribution shifts)
     # Set to None to disable, use RolloutCorrectionConfig presets (e.g., .tis(), .mis()), or pass dict
     rollout_correction: Optional[RolloutCorrectionConfig] = None
