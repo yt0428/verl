@@ -38,6 +38,7 @@ from verl.trainer.ppo.utils import need_reward_model
 from verl.utils import normalize_token_ids
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.profiler import marked_timer
+from verl.utils.ray_utils import auto_await
 from verl.utils.rollout_trace import rollout_trace_op
 from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.llm_server import LLMServerClient, LLMServerManager
@@ -387,6 +388,36 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
                     await self._worker_queue.put(worker)
         return self._worker_queue
 
+    async def _dispatch_to_workers(self, prompts: DataProto) -> list[DataProto]:
+        """Dispatch single-sample shards through the shared worker queue."""
+        queue = await self._init_worker_queue()
+        single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
+
+        async def process_task(sample: DataProto) -> DataProto:
+            worker = await queue.get()
+            try:
+                output_future = worker.generate_sequences.remote(sample)
+                return await asyncio.wrap_future(output_future.future())
+            finally:
+                # Always return worker to queue after task completes or fails.
+                await queue.put(worker)
+                queue.task_done()
+
+        return await asyncio.gather(*[process_task(sample) for sample in single_samples])
+
+    @auto_await
+    async def generate_sequences(self, prompts: DataProto) -> DataProto:
+        """Run validation rollouts using the same global worker queue as train rollouts."""
+        outputs = await self._dispatch_to_workers(prompts)
+        outputs = self._align_rollout_shard_keys(outputs)
+        output = DataProto.concat(outputs)
+
+        # Keep the same meta_info contract as AgentLoopManager.generate_sequences.
+        metrics = [o.meta_info.pop("metrics") for o in outputs]
+        timing = self._performance_metrics(metrics, output)
+        output.meta_info = {"timing": timing, **outputs[0].meta_info}
+        return output
+
     async def generate_sequences_single(self, prompts: DataProto) -> DataProto:
         """Split input batch and dispatch to agent loop workers.
 
@@ -395,22 +426,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         Returns:
             DataProto: Output batch.
         """
-        # Split to single-sample tasks and dispatch at worker granularity.
-        queue = await self._init_worker_queue()
-        single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
-
-        async def process_task(sample: DataProto) -> DataProto:
-            worker = await queue.get()
-            try:
-                output_future = worker.generate_sequences.remote(sample)
-                result = await asyncio.wrap_future(output_future.future())
-                return result
-            finally:
-                # Always return worker to queue after task completes or fails.
-                await queue.put(worker)
-                queue.task_done()
-
-        outputs = await asyncio.gather(*[process_task(sample) for sample in single_samples])
+        outputs = await self._dispatch_to_workers(prompts)
         return self._concat_outputs_same_metrics_layout(outputs)
 
     async def _select_best_worker(self):
