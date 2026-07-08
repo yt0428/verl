@@ -15,8 +15,10 @@
 import asyncio
 import logging
 import os
+import threading
 import time
 from pprint import pformat
+from queue import Queue
 from typing import Any, Optional
 
 import numpy as np
@@ -376,16 +378,16 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         reward_loop_worker_handles: list[ray.actor.ActorHandle] = None,
     ):
         super().__init__(config, llm_client, teacher_client, reward_loop_worker_handles)
-        self._worker_queue: Optional[asyncio.Queue] = None
-        self._worker_queue_lock = asyncio.Lock()
+        self._worker_queue: Optional[Queue] = None
+        self._worker_queue_lock = threading.Lock()
 
-    async def _init_worker_queue(self) -> asyncio.Queue:
-        """Initialize worker queue lazily."""
-        async with self._worker_queue_lock:
+    async def _init_worker_queue(self) -> Queue:
+        """Initialize the loop-neutral worker queue lazily."""
+        with self._worker_queue_lock:
             if self._worker_queue is None:
-                self._worker_queue = asyncio.Queue()
+                self._worker_queue = Queue()
                 for worker in self.agent_loop_workers:
-                    await self._worker_queue.put(worker)
+                    self._worker_queue.put(worker)
         return self._worker_queue
 
     async def _dispatch_to_workers(self, prompts: DataProto) -> list[DataProto]:
@@ -394,13 +396,13 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
         single_samples = list(prompts.chunk(len(prompts)))  # List[DataProto], each DataProto has batch_size=1
 
         async def process_task(sample: DataProto) -> DataProto:
-            worker = await queue.get()
+            worker = await asyncio.to_thread(queue.get)
             try:
                 output_future = worker.generate_sequences.remote(sample)
                 return await asyncio.wrap_future(output_future.future())
             finally:
                 # Always return worker to queue after task completes or fails.
-                await queue.put(worker)
+                queue.put(worker)
                 queue.task_done()
 
         return await asyncio.gather(*[process_task(sample) for sample in single_samples])
@@ -432,7 +434,7 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
     async def _select_best_worker(self):
         """Select an idle worker from queue (deprecated, use queue directly)."""
         queue = await self._init_worker_queue()
-        return await queue.get()
+        return await asyncio.to_thread(queue.get)
 
     @staticmethod
     def _align_rollout_shard_keys(outputs: list[DataProto]) -> list[DataProto]:
