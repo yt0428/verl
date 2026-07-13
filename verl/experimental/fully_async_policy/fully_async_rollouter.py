@@ -407,6 +407,11 @@ class FullyAsyncAgentLoopManager(AgentLoopManager):
 
         return await asyncio.gather(*[process_task(sample) for sample in single_samples])
 
+    async def get_idle_worker_count(self) -> int:
+        """Return the approximate number of idle agent-loop workers."""
+        queue = await self._init_worker_queue()
+        return queue.qsize()
+
     @auto_await
     async def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Run validation rollouts using the same global worker queue as train rollouts."""
@@ -587,6 +592,13 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         self.max_concurrent_samples = None
         # queue size
         self.max_queue_size = None
+        # During validation, pause new rollout task launches by default. If this
+        # threshold is set, rollout may launch only when idle workers stay above it.
+        self.validation_active = False
+        self.validation_rollout_min_idle_workers = config.async_training.get(
+            "validation_rollout_min_idle_workers", None
+        )
+        self.validation_launch_check_interval = config.async_training.get("validation_launch_check_interval", 60)
 
         # Statistics
         self.total_generated_samples = 0
@@ -699,12 +711,30 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
         """Stop rollout profiling on all replicas before the next weight sync."""
         await self.llm_server_manager.stop_profile()
 
-    def do_validate(self):
+    async def do_validate(self):
         """Run validation and return metrics"""
+        self.global_steps += 1
+        global_steps = self.global_steps
         timing_raw = {}
-        with marked_timer("rollouter/validate_time", timing_raw, color="green"):
-            val_metrics: dict = self._validate()
+        self.validation_active = True
+        try:
+            with marked_timer("rollouter/validate_time", timing_raw, color="green"):
+                val_metrics: dict = await asyncio.to_thread(self._validate, global_steps=global_steps)
+        finally:
+            self.validation_active = False
         return timing_raw | val_metrics
+
+    async def _can_launch_rollout_during_validation(self) -> bool:
+        if not self.validation_active:
+            return True
+        if self.validation_rollout_min_idle_workers is None:
+            return False
+        idle_workers = await self.async_rollout_manager.get_idle_worker_count()
+        return idle_workers > self.validation_rollout_min_idle_workers
+
+    async def _wait_until_rollout_launch_allowed(self):
+        while not await self._can_launch_rollout_during_validation():
+            await asyncio.sleep(self.validation_launch_check_interval)
 
     async def save_checkpoint(self, local_global_step_folder: str):
         # WARNING!: Due to the asynchronous nature, there are some in-flight samples
@@ -989,6 +1019,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
                         resume_future.cancel()
                         await asyncio.gather(resume_future, return_exceptions=True)
                 continue
+            await self._wait_until_rollout_launch_allowed()
             # Get sample from appropriate queue and immediately mark task as done
             rollout_sample = await self.pending_queue.get()
             self.pending_queue.task_done()
@@ -1021,6 +1052,7 @@ class FullyAsyncRollouter(SeparateRayPPOTrainer):
             # Submit single sample processing
             if self.paused:
                 await self._resume_event.wait()
+            await self._wait_until_rollout_launch_allowed()
             async with self.lock:
                 task = safe_create_task(
                     self._process_single_sample_streaming(rollout_sample),

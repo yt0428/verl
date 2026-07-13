@@ -479,9 +479,10 @@ class RayPPOTrainer:
 
         print(f"Dumped generations to {filename}")
 
-    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path):
+    def _dump_generations(self, inputs, outputs, gts, scores, reward_extra_infos_dict, dump_path, global_steps=None):
         """Dump rollout/validation samples as JSONL asynchronously."""
-        global_steps = self.global_steps
+        if global_steps is None:
+            global_steps = self.global_steps
         future = self._dump_executor.submit(
             self._write_generations,
             inputs,
@@ -548,7 +549,7 @@ class RayPPOTrainer:
                 dump_path=rollout_data_dir,
             )
 
-    def _maybe_log_val_generations(self, inputs, outputs, scores):
+    def _maybe_log_val_generations(self, inputs, outputs, scores, global_steps=None):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
 
         generations_to_log = self.config.trainer.log_val_generations
@@ -570,7 +571,9 @@ class RayPPOTrainer:
         samples = samples[:generations_to_log]
 
         # Log to each configured logger
-        self.validation_generations_logger.log(self.config.trainer.logger, samples, self.global_steps)
+        if global_steps is None:
+            global_steps = self.global_steps
+        self.validation_generations_logger.log(self.config.trainer.logger, samples, global_steps)
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
         reward_keys = set({"data_source", "reward_model", "extra_info", "uid"}) & batch.non_tensor_batch.keys()
@@ -596,7 +599,10 @@ class RayPPOTrainer:
         batch_reward = self.reward_loop_manager.compute_rm_score(batch)
         return batch_reward
 
-    def _validate(self, merged: bool = False):
+    def _validate(self, merged: bool = False, global_steps: Optional[int] = None):
+        if global_steps is None:
+            global_steps = self.global_steps
+
         data_source_lst = []
         reward_extra_infos_dict: dict[str, list] = defaultdict(list)
 
@@ -633,7 +639,7 @@ class RayPPOTrainer:
                 "recompute_log_prob": False,
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
-                "global_steps": self.global_steps,
+                "global_steps": global_steps,
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
@@ -650,7 +656,7 @@ class RayPPOTrainer:
                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
                 # wake up rollout model
                 # replace with wake_up method once supported
-                self.checkpoint_manager.update_weights(self.global_steps)
+                self.checkpoint_manager.update_weights(global_steps)
 
             # unpad
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
@@ -693,7 +699,12 @@ class RayPPOTrainer:
 
             data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
 
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+        self._maybe_log_val_generations(
+            inputs=sample_inputs,
+            outputs=sample_outputs,
+            scores=sample_scores,
+            global_steps=global_steps,
+        )
 
         # dump generations
         val_data_dir = self.config.trainer.get("validation_data_dir", None)
@@ -705,6 +716,7 @@ class RayPPOTrainer:
                 scores=sample_scores,
                 reward_extra_infos_dict=reward_extra_infos_dict,
                 dump_path=val_data_dir,
+                global_steps=global_steps,
             )
 
         for key_info, lst in reward_extra_infos_dict.items():
