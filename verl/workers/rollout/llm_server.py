@@ -176,6 +176,40 @@ class LLMServerClient:
         # Awaiting here risks blocking the finally clause if the LB actor is unresponsive.
         self._load_balancer.release_server.remote(server_id=server_id)
 
+    async def kv_cache_usage_probe(self, request_id: str) -> dict[str, Any]:
+        """Return KV cache usage from the sticky server for ``request_id``.
+
+        Backends that do not implement the probe return an empty dict so callers
+        can gracefully fall back to normal scheduling.
+        """
+        server_id, server = await self._acquire_server(request_id)
+        try:
+            try:
+                return await server.kv_cache_usage_probe.remote()
+            except Exception as exc:
+                logger.debug(
+                    "kv_cache_usage_probe failed on server=%s request_id=%s: %s",
+                    server_id, request_id, exc,
+                )
+                return {}
+        finally:
+            self._release_server(server_id)
+
+    async def prefix_cache_probe(self, request_id: str, *, prompt_ids: list[int]) -> dict[str, Any]:
+        """Probe prefix-cache residency on the sticky server for ``request_id``."""
+        server_id, server = await self._acquire_server(request_id)
+        try:
+            try:
+                return await server.prefix_cache_probe.remote(prompt_ids=prompt_ids)
+            except Exception as exc:
+                logger.debug(
+                    "prefix_cache_probe failed on server=%s request_id=%s: %s",
+                    server_id, request_id, exc,
+                )
+                return {}
+        finally:
+            self._release_server(server_id)
+
     @rollout_trace_op
     async def generate(
         self,

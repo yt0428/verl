@@ -601,6 +601,22 @@ class vLLMHttpServer:
             extra_fields=extra_fields,
         )
 
+    async def kv_cache_usage_probe(self) -> dict[str, Any]:
+        if self.node_rank != 0:
+            return {}
+        if not hasattr(self.engine, "kv_cache_usage_probe"):
+            return {}
+        return await self.engine.kv_cache_usage_probe()
+
+    async def prefix_cache_probe(self, prompt_ids: list[int]) -> dict[str, Any]:
+        if self.node_rank != 0:
+            return {}
+        if not hasattr(self.engine, "prefix_cache_probe"):
+            return {}
+        prompt_ids = normalize_token_ids(prompt_ids)
+        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
+        return await self.engine.prefix_cache_probe(prompt_ids)
+
     async def wake_up(self, tags: list[str] | None = None):
         if self.node_rank != 0:
             return
